@@ -1,7 +1,6 @@
 package tool
 
 import (
-	"encoding/base64"
 	"github.com/go-redis/redis"
 	_ "github.com/go-sql-driver/mysql"
 	"websocketIMProject/model"
@@ -41,16 +40,4 @@ func InitRedisEngine() error {
 	Rediscli = client
 
 	return err
-}
-
-func BaseEncode(data []byte) string {
-	return base64.StdEncoding.EncodeToString(data)
-}
-
-func BaseDecode(data string) []byte {
-	decodeString, err := base64.StdEncoding.DecodeString(data)
-	if err != nil {
-		return nil
-	}
-	return decodeString
 }

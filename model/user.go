@@ -25,3 +25,17 @@ type User struct {
 	Memo     string    `xorm:"varchar(140)" form:"memo" json:"memo"`     // 什么角色
 	Createat time.Time `xorm:"datetime" form:"createat" json:"createat"` // 什么角色
 }
+
+type ArchiveUserFile struct {
+	//用户ID
+	Id        int64     `xorm:"pk autoincr bigint(20)" form:"id" json:"id"`
+	GroupSets []byte    `xorm:"BLOB" form:"groupsets" json:"groupsets"`
+	Createat  time.Time `xorm:"datetime" form:"createat" json:"createat"` // 什么角色
+}
+
+type UserDataQueue struct {
+	Id        int64  `xorm:"pk autoincr bigint(20)" form:"id" json:"id"`
+	UserId    int64  `xorm:"bigint(20) index(idx_uid)" form:"userid" json:"userid"`
+	TimeStamp int64  `xorm:"bigint(20)" form:"timestamp" json:"timestamp"`
+	Data      []byte `xorm:"BLOB" form:"data" json:"data"`
+}

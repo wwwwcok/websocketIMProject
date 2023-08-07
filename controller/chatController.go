@@ -6,12 +6,15 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
 	"gopkg.in/fatih/set.v0"
+	"log"
 	"net"
 	"net/http"
 	"runtime"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
+	"unsafe"
 	"websocketIMProject/model"
 	"websocketIMProject/service"
 	"websocketIMProject/tool"
@@ -22,9 +25,9 @@ type Node struct {
 	//并行转串行,
 	DataQueue     chan []byte
 	GroupSets     set.Interface
-	lastHeartbeat int64
-	//在线状态
-	status bool
+	LastHeartbeat int64
+	//在线状态，暂时未用
+	Status bool
 }
 
 var (
@@ -32,9 +35,9 @@ var (
 	rwlocker  sync.RWMutex
 )
 
-const maxIdleConnectionTime = 1000000000 * 60 * 30 //半个小时
+const maxIdleConnectionTime = time.Minute * 30 //半个小时
 
-const maxIdleduration = 1000000000 * 60 * 60 * 24 * 3 //半个小时
+const maxIdleduration = time.Hour * 24 * 90 //90天
 
 type ChatController struct {
 }
@@ -70,16 +73,30 @@ func (m *ChatController) Chat(ctx *gin.Context) {
 	if err != nil {
 		tool.Fail(ctx, fmt.Sprintln(err))
 	}
-	node := &Node{
-		Conn:      conn, //外部调用此路由时的conn
-		DataQueue: make(chan []byte, 50),
-		//用于群聊，如果选用根据群id后以遍历用户id的方式向群中的所有户发信息的方法，那么就不需要这一个字段
-		GroupSets: set.New(set.ThreadSafe),
+
+	var node *Node
+
+	//查看是不是老用户
+	if CheckExist(userId) {
+		//此为老用户回归的步骤
+		*node = userBack(userId)
+		node.Conn = conn
+		node.Status = true
+		node.GroupSets = set.New(set.ThreadSafe)
+	} else {
+		node = &Node{
+			Conn:      conn, //外部调用此路由时的conn
+			DataQueue: make(chan []byte, 50),
+			//用于群聊，如果选用根据群id后以遍历用户id的方式向群中的所有户发信息的方法，那么就不需要这一个字段
+			GroupSets: set.New(set.ThreadSafe),
+			Status:    true,
+		}
 	}
+
 	//初始化时，获取接入用户的全部群id
 	contact := service.ContactService{}
 	comIds := contact.SearchComunityIds(userId)
-	//将数据库中拿取出来的值刷新node的的groupset中
+	//将数据库中拿取出来的值刷新node的groupset中
 	for _, comId := range comIds {
 		node.GroupSets.Add(comId)
 	}
@@ -121,7 +138,7 @@ func recvproc(node *Node) {
 		data := make([]byte, 0)
 		ty, data, err := node.Conn.ReadMessage()
 		if ty == 1000 {
-			node.status = false
+			node.Status = false
 		}
 		if err != nil {
 			fmt.Println(err)
@@ -208,7 +225,7 @@ func dispatch(data []byte) {
 		}
 	case model.CMD_HEART:
 		// 心跳为保证网络持久性。数据来源若是心跳事件一般什么都不做,更新时间戳
-		clientMap[msg.Userid].lastHeartbeat = time.Now().UnixNano()
+		clientMap[msg.Userid].LastHeartbeat = time.Now().UnixNano()
 
 	}
 }
@@ -233,7 +250,28 @@ func sendMsg(userId int64, msg []byte) {
 	rwlocker.Unlock()
 	if ok {
 		node.DataQueue <- msg
+	} else {
+		if CheckExist(userId) {
+			//如果存在先将离线消息写入redis，待对方登录时从中读取
+			err := tool.CacheStoreMsg(msg, userId)
+			if err != nil {
+				return
+			}
+		}
 	}
+}
+
+func CheckExist(userId int64) bool {
+	db := tool.XormMysqlEngine
+	clientData := model.User{}
+	n, err := db.Table("user_stored").Where("userid = ?", userId).Get(&clientData)
+	if err != nil || n == false {
+		log.Fatal(err)
+		return false
+	}
+
+	return true
+
 }
 
 func checkToken(userId int64, token string) bool {
@@ -249,8 +287,13 @@ func cleanConnection() {
 	defer rwlocker.RUnlock()
 	curTime := time.Now().UnixNano()
 	for userid, node := range clientMap {
-		if node.lastHeartbeat+maxIdleConnectionTime > curTime {
+		if node.LastHeartbeat+int64(maxIdleConnectionTime) > curTime {
 			fmt.Println("心跳超时。。断开连接")
+			//原子修改节点状态值
+			pointer := unsafe.Pointer(&node.Status)
+			newBool := false
+			atomic.StorePointer(&pointer, unsafe.Pointer(&newBool))
+			//node.Status = false
 			//TODO 将收件箱里的信息存储至redis离线消息表及mysql的历史消息表中
 			procOfflineMessage(userid, node)
 			node.Conn.Close()
@@ -263,7 +306,7 @@ func cleanClientMap() {
 	rwlocker.RLock()
 	curTime := time.Now().UnixNano()
 	for key, node := range clientMap {
-		if node.lastHeartbeat+maxIdleduration > curTime && node.status == false {
+		if node.LastHeartbeat+int64(maxIdleduration) > curTime && node.Status == false {
 			fmt.Println("用户长时间未登录。。清理连接")
 			rwlocker.RUnlock()
 			rwlocker.Lock()
@@ -281,14 +324,18 @@ func procOfflineMessage(userid int64, node *Node) {
 	if node.DataQueue == nil {
 		return
 	}
-	cacheCli := tool.Rediscli
 	for {
+		//每次存储一条信息，并设置过期时间7天
 		bytes, ok := <-node.DataQueue
 		if ok == true {
-			msg := tool.BaseEncode(bytes)
-			cacheCli.LPush(strconv.FormatInt(userid, 10), msg)
+			//存储到redis中
+			err := tool.CacheStoreMsg(bytes, userid)
+			if err != nil {
+				return
+			}
 			//存入历史消息中
-			storeHistoryMessage(userid, []byte(msg))
+			//TODO 尝试使用消息队列将历史消息写入数据库，解耦流程
+			storeHistoryMessage(userid, []byte(tool.BaseEncode(bytes)))
 		} else {
 			return
 		}
@@ -299,7 +346,7 @@ func procOfflineMessage(userid int64, node *Node) {
 func storeHistoryMessage(userid int64, data []byte) {
 	db := tool.XormMysqlEngine
 	msg := model.HistoryMessage{}
-	err := json.Unmarshal(data, msg)
+	err := json.Unmarshal(data, &msg)
 	//当前unix时间戳，纳秒
 	msg.Timestamp = time.Now().UnixNano()
 	if err != nil {
@@ -312,12 +359,57 @@ func storeHistoryMessage(userid int64, data []byte) {
 		fmt.Println(err)
 		return
 	}
+}
 
+func userBack(userId int64) Node {
+	//查看是不是老用户
+	//此为老用户回归的步骤
+	node := Node{
+		Conn:          nil,
+		DataQueue:     make(chan []byte, 50),
+		GroupSets:     nil,
+		LastHeartbeat: time.Now().UnixNano(),
+		Status:        false,
+	}
+	db := tool.XormMysqlEngine
+	nodeData := make([]struct {
+		Data []byte
+	}, 0)
+
+	//分别获取Node的群信息和data信息
+	db.Table("archive_user_file").Join("Inner", "user_data_queue", "archive_user_file.id = user_data_queue.userid").Cols("user_data_queue.data").OrderBy("user_data_queue.timestamp").Find(&nodeData)
+
+	//-----------------
+	//可以直接通过群表获得，不需要这样
+	//nodeGroup := struct {
+	//	BinarySet []byte
+	//}{}
+	//db.Table("archive_user_file").Cols("archive_user_file.groupsets").Get(&nodeGroup)
+	////将群信息存入node的GroupSets
+	//node.GroupSets = tool.GobDecode(nodeGroup.BinarySet, node.GroupSets).(set.Interface)
+	//---------
+
+	//将数据存入node的DataQueue
+	for _, s := range nodeData {
+		node.DataQueue <- s.Data
+	}
+	return node
+}
+
+//断线检测,检测节点断线
+func CheckUserStatus() {
+	for _, node := range clientMap {
+		//判断是否已经断开连接
+		if node.Conn == nil {
+			node.Status = false
+		}
+	}
 }
 
 func init() {
 	go cleanClientMap()
 	go cleanConnection()
+	go CheckUserStatus()
 	//当前未使用
 	go udprecvproc()
 	go udpsendproc()
